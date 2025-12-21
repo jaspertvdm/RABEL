@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-server-rabel"
-version = "0.1.0"
+version = "0.2.0"
 description = "RABEL - Recidive Active Brain Environment Layer. Local-first AI memory with semantic search, graph relations, and soft pipelines."
 readme = "README.md"
 license = "MIT"
