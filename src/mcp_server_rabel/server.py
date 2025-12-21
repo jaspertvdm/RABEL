@@ -1,8 +1,15 @@
 """
-RABEL MCP Server - The Brain Layer v0.2.1
+RABEL MCP Server - The Brain Layer v0.3.0
 ==========================================
 
 Exposes RABEL memory capabilities via MCP protocol.
+
+New in 0.3.0:
+- I-POLL: Inter-Intelligence Polling Protocol
+- AI-to-AI communication via push/pull/respond
+- Poll types: PUSH, PULL, SYNC, TASK, ACK
+- Automatic archiving for GPT summarization
+- Real-time collaboration between Claude, Gemini, GPT
 
 New in 0.2.1 (Gemini's refinements):
 - RRF (Reciprocal Rank Fusion) for hybrid search scoring
@@ -135,6 +142,25 @@ class RABELCore:
                 created_at TEXT NOT NULL
             );
 
+            -- I-POLL: Inter-Intelligence Polling Protocol
+            CREATE TABLE IF NOT EXISTS polls (
+                id TEXT PRIMARY KEY,
+                from_agent TEXT NOT NULL,
+                to_agent TEXT NOT NULL,
+                poll_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                response TEXT,
+                session_id TEXT,
+                created_at TEXT NOT NULL,
+                read_at TEXT,
+                responded_at TEXT,
+                archived_at TEXT,
+                metadata TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_polls_to_agent ON polls(to_agent, status);
+            CREATE INDEX IF NOT EXISTS idx_polls_session ON polls(session_id);
             CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope);
             CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
             CREATE INDEX IF NOT EXISTS idx_relations_subject ON relations(subject);
@@ -772,12 +798,208 @@ class RABELCore:
         ).fetchall()
         return [{"id": r[0], "name": r[1], "description": r[2], "scope": r[3]} for r in results]
 
+    # =========================================================================
+    # I-POLL: Inter-Intelligence Polling Protocol
+    # =========================================================================
+
+    def poll_push(self, from_agent: str, to_agent: str, content: str,
+                  poll_type: str = "PUSH", session_id: str = None,
+                  metadata: dict = None) -> Dict:
+        """
+        Push a message to another agent.
+
+        Poll types:
+        - PUSH: "I found/did this" (informational)
+        - PULL: "What do you know about X?" (request)
+        - SYNC: "Let's exchange context" (bidirectional)
+        - TASK: "Can you do this?" (delegation)
+        - ACK: "Understood/Done" (acknowledgment)
+        """
+        poll_id = self._generate_id(f"{from_agent}{to_agent}{content}")
+
+        self.conn.execute("""
+            INSERT INTO polls (id, from_agent, to_agent, poll_type, content,
+                              status, session_id, created_at, metadata)
+            VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+        """, (poll_id, from_agent, to_agent, poll_type, content,
+              session_id, datetime.now().isoformat(), json.dumps(metadata or {})))
+        self.conn.commit()
+
+        return {
+            "id": poll_id,
+            "from": from_agent,
+            "to": to_agent,
+            "type": poll_type,
+            "status": "pending"
+        }
+
+    def poll_pull(self, agent: str, mark_read: bool = True) -> List[Dict]:
+        """
+        Pull pending messages for an agent.
+
+        Returns all pending polls addressed to this agent.
+        Optionally marks them as 'read'.
+        """
+        results = self.conn.execute("""
+            SELECT id, from_agent, to_agent, poll_type, content, status,
+                   session_id, created_at, metadata
+            FROM polls
+            WHERE to_agent = ? AND status = 'pending'
+            ORDER BY created_at ASC
+        """, (agent,)).fetchall()
+
+        polls = []
+        for r in results:
+            poll = {
+                "id": r[0],
+                "from": r[1],
+                "to": r[2],
+                "type": r[3],
+                "content": r[4],
+                "status": r[5],
+                "session_id": r[6],
+                "created_at": r[7],
+                "metadata": json.loads(r[8]) if r[8] else {}
+            }
+            polls.append(poll)
+
+            if mark_read:
+                self.conn.execute("""
+                    UPDATE polls SET status = 'read', read_at = ?
+                    WHERE id = ?
+                """, (datetime.now().isoformat(), r[0]))
+
+        if mark_read and polls:
+            self.conn.commit()
+
+        return polls
+
+    def poll_respond(self, poll_id: str, response: str, from_agent: str) -> Dict:
+        """
+        Respond to a poll.
+
+        Creates a response poll back to the original sender.
+        """
+        # Get original poll
+        original = self.conn.execute("""
+            SELECT from_agent, to_agent, poll_type, session_id
+            FROM polls WHERE id = ?
+        """, (poll_id,)).fetchone()
+
+        if not original:
+            return {"error": f"Poll {poll_id} not found"}
+
+        # Mark original as responded
+        self.conn.execute("""
+            UPDATE polls SET status = 'responded', response = ?, responded_at = ?
+            WHERE id = ?
+        """, (response, datetime.now().isoformat(), poll_id))
+
+        # Create response poll
+        response_poll = self.poll_push(
+            from_agent=from_agent,
+            to_agent=original[0],  # Send back to original sender
+            content=response,
+            poll_type="ACK" if original[2] == "TASK" else "PUSH",
+            session_id=original[3]
+        )
+
+        return {
+            "original_id": poll_id,
+            "response_id": response_poll["id"],
+            "status": "responded"
+        }
+
+    def poll_history(self, agent: str = None, session_id: str = None,
+                     limit: int = 20, include_archived: bool = False) -> List[Dict]:
+        """
+        Get poll history for an agent or session.
+        """
+        query = "SELECT * FROM polls WHERE 1=1"
+        params = []
+
+        if agent:
+            query += " AND (from_agent = ? OR to_agent = ?)"
+            params.extend([agent, agent])
+        if session_id:
+            query += " AND session_id = ?"
+            params.append(session_id)
+        if not include_archived:
+            query += " AND status != 'archived'"
+
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+
+        results = self.conn.execute(query, params).fetchall()
+
+        return [
+            {
+                "id": r[0],
+                "from": r[1],
+                "to": r[2],
+                "type": r[3],
+                "content": r[4],
+                "status": r[5],
+                "response": r[6],
+                "session_id": r[7],
+                "created_at": r[8]
+            }
+            for r in results
+        ]
+
+    def poll_status(self, agent: str) -> Dict:
+        """
+        Get poll status overview for an agent.
+        """
+        pending = self.conn.execute(
+            "SELECT COUNT(*) FROM polls WHERE to_agent = ? AND status = 'pending'",
+            (agent,)
+        ).fetchone()[0]
+
+        unread = self.conn.execute(
+            "SELECT COUNT(*) FROM polls WHERE to_agent = ? AND status = 'read'",
+            (agent,)
+        ).fetchone()[0]
+
+        sent = self.conn.execute(
+            "SELECT COUNT(*) FROM polls WHERE from_agent = ?",
+            (agent,)
+        ).fetchone()[0]
+
+        return {
+            "agent": agent,
+            "pending": pending,
+            "unread": unread,
+            "sent": sent,
+            "status": "active" if pending > 0 else "idle"
+        }
+
+    def poll_archive_session(self, session_id: str, summary: str = None) -> Dict:
+        """
+        Archive all polls in a session (for GPT summarization).
+        """
+        count = self.conn.execute("""
+            UPDATE polls
+            SET status = 'archived', archived_at = ?, response = COALESCE(response, ?)
+            WHERE session_id = ? AND status != 'archived'
+        """, (datetime.now().isoformat(), summary, session_id)).rowcount
+
+        self.conn.commit()
+
+        return {
+            "session_id": session_id,
+            "archived_count": count,
+            "summary": summary
+        }
+
     def get_stats(self) -> Dict:
         """Get memory statistics."""
         total = self.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
         relations = self.conn.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
         templates = self.conn.execute("SELECT COUNT(*) FROM task_templates").fetchone()[0]
         context_bases = self.conn.execute("SELECT COUNT(*) FROM context_bases").fetchone()[0]
+        polls_total = self.conn.execute("SELECT COUNT(*) FROM polls").fetchone()[0]
+        polls_pending = self.conn.execute("SELECT COUNT(*) FROM polls WHERE status = 'pending'").fetchone()[0]
 
         # Check FTS5 availability
         fts5_available = False
@@ -792,12 +1014,15 @@ class RABELCore:
             "total_relations": relations,
             "task_templates": templates,
             "context_bases": context_bases,
+            "polls_total": polls_total,
+            "polls_pending": polls_pending,
             "db_path": str(self.db_path),
             "vector_search": SQLITE_VEC_AVAILABLE,
             "fts5_search": fts5_available,
             "hybrid_search": SQLITE_VEC_AVAILABLE and fts5_available,
             "ollama_available": OLLAMA_AVAILABLE,
             "features": {
+                "i_poll": True,
                 "rrf_scoring": True,
                 "tunable_decay": True,
                 "conflict_detection": True,
@@ -1012,6 +1237,61 @@ async def list_tools() -> list[types.Tool]:
             name="rabel_stats",
             description="Get RABEL memory statistics including new features.",
             inputSchema={"type": "object", "properties": {}, "required": []}
+        ),
+        # I-POLL: Inter-Intelligence Polling Protocol
+        types.Tool(
+            name="rabel_poll_push",
+            description="Push a message to another AI agent. Use this to send info, tasks, or sync requests to Claude, Gemini, or GPT.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string", "description": "Target agent: claude, gemini, gpt, or any agent name"},
+                    "content": {"type": "string", "description": "The message content"},
+                    "poll_type": {"type": "string", "description": "Type: PUSH (info), PULL (request), SYNC (exchange), TASK (delegate), ACK (confirm)", "default": "PUSH"},
+                    "session_id": {"type": "string", "description": "Optional session ID to group related polls"}
+                },
+                "required": ["to", "content"]
+            }
+        ),
+        types.Tool(
+            name="rabel_poll_pull",
+            description="Pull pending messages for yourself. Check if other agents have sent you anything.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "mark_read": {"type": "boolean", "description": "Mark messages as read (default: true)", "default": True}
+                },
+                "required": []
+            }
+        ),
+        types.Tool(
+            name="rabel_poll_respond",
+            description="Respond to a specific poll. Use the poll_id from a received message.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "poll_id": {"type": "string", "description": "The poll ID to respond to"},
+                    "response": {"type": "string", "description": "Your response content"}
+                },
+                "required": ["poll_id", "response"]
+            }
+        ),
+        types.Tool(
+            name="rabel_poll_status",
+            description="Get your poll status - pending messages, sent count, etc.",
+            inputSchema={"type": "object", "properties": {}, "required": []}
+        ),
+        types.Tool(
+            name="rabel_poll_history",
+            description="Get poll history for your conversations with other agents.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "Filter by session ID"},
+                    "limit": {"type": "integer", "description": "Max results (default 20)", "default": 20}
+                },
+                "required": []
+            }
         )
     ]
 
@@ -1276,7 +1556,7 @@ New: {content[:50]}..."""
 
             return [types.TextContent(
                 type="text",
-                text=f"""📊 RABEL Statistics v0.2.0
+                text=f"""📊 RABEL Statistics v0.3.0
 
 **Storage:**
 • Total memories: {stats['total_memories']}
@@ -1285,6 +1565,10 @@ New: {content[:50]}..."""
 • Context bases: {stats['context_bases']}
 • Database: {stats['db_path']}
 
+**I-Poll (AI-to-AI):**
+• Total polls: {stats['polls_total']}
+• Pending: {stats['polls_pending']}
+
 **Search Capabilities:**
 • Vector search: {'✅' if stats['vector_search'] else '❌'}
 • FTS5 search: {'✅' if stats['fts5_search'] else '❌'}
@@ -1292,11 +1576,109 @@ New: {content[:50]}..."""
 • Ollama: {'✅' if stats['ollama_available'] else '❌'}
 
 **Features:**
-• Recency bias: ✅
-• Memory reflection: ✅
-• Task templates: ✅
-• Context bases: ✅"""
+• I-Poll: ✅
+• RRF scoring: ✅
+• Tunable decay: ✅
+• Conflict detection: ✅"""
             )]
+
+        # I-POLL: Inter-Intelligence Polling Protocol handlers
+        elif name == "rabel_poll_push":
+            r = get_rabel()
+            # Determine our agent name (claude by default, can be overridden)
+            from_agent = arguments.get("from", "claude")
+            to_agent = arguments["to"]
+            content = arguments["content"]
+            poll_type = arguments.get("poll_type", "PUSH")
+            session_id = arguments.get("session_id")
+
+            result = r.poll_push(from_agent, to_agent, content, poll_type, session_id)
+
+            return [types.TextContent(
+                type="text",
+                text=f"""📤 Poll sent!
+To: {to_agent}
+Type: {poll_type}
+ID: {result['id']}
+Content: {content[:100]}..."""
+            )]
+
+        elif name == "rabel_poll_pull":
+            r = get_rabel()
+            # Determine our agent name
+            agent = arguments.get("agent", "claude")
+            mark_read = arguments.get("mark_read", True)
+
+            polls = r.poll_pull(agent, mark_read)
+
+            if not polls:
+                return [types.TextContent(type="text", text="📭 No pending messages.")]
+
+            output = f"📬 {len(polls)} pending message(s):\n\n"
+            for p in polls:
+                output += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                output += f"From: {p['from']} | Type: {p['type']}\n"
+                output += f"ID: {p['id']}\n"
+                output += f"Content: {p['content']}\n"
+                output += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+            return [types.TextContent(type="text", text=output)]
+
+        elif name == "rabel_poll_respond":
+            r = get_rabel()
+            poll_id = arguments["poll_id"]
+            response = arguments["response"]
+            from_agent = arguments.get("from", "claude")
+
+            result = r.poll_respond(poll_id, response, from_agent)
+
+            if "error" in result:
+                return [types.TextContent(type="text", text=f"❌ {result['error']}")]
+
+            return [types.TextContent(
+                type="text",
+                text=f"""✅ Response sent!
+Original poll: {result['original_id']}
+Response poll: {result['response_id']}
+Status: {result['status']}"""
+            )]
+
+        elif name == "rabel_poll_status":
+            r = get_rabel()
+            agent = arguments.get("agent", "claude")
+
+            status = r.poll_status(agent)
+
+            emoji = "🟢" if status["pending"] > 0 else "⚪"
+            return [types.TextContent(
+                type="text",
+                text=f"""{emoji} Poll Status for {status['agent']}
+
+📬 Pending: {status['pending']}
+📖 Read (unresponded): {status['unread']}
+📤 Sent: {status['sent']}
+Status: {status['status']}"""
+            )]
+
+        elif name == "rabel_poll_history":
+            r = get_rabel()
+            agent = arguments.get("agent", "claude")
+            session_id = arguments.get("session_id")
+            limit = arguments.get("limit", 20)
+
+            history = r.poll_history(agent, session_id, limit)
+
+            if not history:
+                return [types.TextContent(type="text", text="📜 No poll history found.")]
+
+            output = f"📜 Poll History ({len(history)} items):\n\n"
+            for p in history:
+                direction = "→" if p['from'] == agent else "←"
+                other = p['to'] if p['from'] == agent else p['from']
+                output += f"{direction} {other} [{p['type']}]: {p['content'][:50]}...\n"
+                output += f"   Status: {p['status']} | {p['created_at'][:16]}\n\n"
+
+            return [types.TextContent(type="text", text=output)]
 
         else:
             return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
