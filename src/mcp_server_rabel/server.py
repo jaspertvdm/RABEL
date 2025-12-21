@@ -1,8 +1,13 @@
 """
-RABEL MCP Server - The Brain Layer v0.2.0
+RABEL MCP Server - The Brain Layer v0.2.1
 ==========================================
 
 Exposes RABEL memory capabilities via MCP protocol.
+
+New in 0.2.1 (Gemini's refinements):
+- RRF (Reciprocal Rank Fusion) for hybrid search scoring
+- Tunable Decay per memory type (facts decay slow, context fast)
+- Enhanced Reflection with conflict detection and archiving
 
 New in 0.2.0:
 - Hybrid Search (FTS5 + Vector) - Thanks Gemini!
@@ -11,8 +16,12 @@ New in 0.2.0:
 - Task Templates - Structured team tasks for AI Team
 - Context Bases - Pre-loaded knowledge domains
 
+Architecture & Design: Root AI (Claude)
+Refinements & Suggestions: Gemini
+Vision & Direction: Jasper @ HumoticaOS
 Inspired by: Mem0 (https://mem0.ai)
-Built by: Jasper & Root AI @ HumoticaOS
+
+One love, one fAmIly 💙
 """
 
 import json
@@ -90,9 +99,14 @@ class RABELCore:
                 id TEXT PRIMARY KEY,
                 content TEXT NOT NULL,
                 scope TEXT DEFAULT 'general',
+                memory_type TEXT DEFAULT 'fact',
+                decay_factor REAL DEFAULT 0.1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT,
                 access_count INTEGER DEFAULT 0,
+                archived INTEGER DEFAULT 0,
+                archived_reason TEXT,
+                superseded_by TEXT,
                 metadata TEXT
             );
 
@@ -242,20 +256,63 @@ class RABELCore:
         timestamp = datetime.now().isoformat()
         return hashlib.sha256(f"{content}{timestamp}".encode()).hexdigest()[:16]
 
-    def _calculate_recency_score(self, created_at: str, base_score: float = 1.0) -> float:
+    # Decay factors per memory type (Gemini's refinement)
+    # Lower = slower decay (facts persist), Higher = faster decay (context fades)
+    DECAY_FACTORS = {
+        "fact": 0.01,      # Facts decay very slowly (name of your cat)
+        "preference": 0.05, # Preferences decay slowly (likes coffee black)
+        "context": 0.3,    # Context decays moderately (current project)
+        "session": 0.5,    # Session info decays fast (today's task)
+        "temporary": 0.9,  # Temporary info decays very fast
+    }
+
+    def _get_decay_factor(self, memory_type: str = "fact") -> float:
+        """Get decay factor for memory type."""
+        return self.DECAY_FACTORS.get(memory_type, 0.1)
+
+    def _calculate_recency_score(self, created_at: str, base_score: float = 1.0,
+                                  decay_factor: float = None, memory_type: str = "fact") -> float:
         """
-        Calculate recency-weighted score (Gemini's suggestion).
-        Recent memories score higher.
+        Calculate recency-weighted score with tunable decay (Gemini's refinement).
+
+        Different memory types decay at different rates:
+        - fact: 0.01 (very slow - "my cat is named Pixel")
+        - preference: 0.05 (slow - "I like dark mode")
+        - context: 0.3 (moderate - "working on RABEL project")
+        - session: 0.5 (fast - "today we're debugging")
+        - temporary: 0.9 (very fast - "run this command")
         """
         try:
             created = datetime.fromisoformat(created_at)
             now = datetime.now()
             days_elapsed = (now - created).days
-            # Decay function: score = base / (days + 1)
-            recency_multiplier = 1.0 / (days_elapsed + 1)
-            return base_score * (0.7 + 0.3 * recency_multiplier)  # 70% base, 30% recency
+
+            # Use provided decay_factor or get from memory_type
+            if decay_factor is None:
+                decay_factor = self._get_decay_factor(memory_type)
+
+            # Exponential decay: score = base * e^(-decay * days)
+            import math
+            recency_multiplier = math.exp(-decay_factor * days_elapsed)
+
+            # 60% base score, 40% recency-adjusted
+            return base_score * (0.6 + 0.4 * recency_multiplier)
         except:
             return base_score
+
+    def _rrf_score(self, ranks: List[int], k: int = 60) -> float:
+        """
+        Reciprocal Rank Fusion (Gemini's refinement).
+
+        Combines multiple ranking signals into a single score.
+        RRF(d) = Σ 1/(k + rank_i(d))
+
+        This is more robust than combining raw scores because:
+        - It's scale-invariant (doesn't matter if FTS5 returns 0-100 or 0-1)
+        - It handles outliers well
+        - It rewards documents that rank highly in multiple systems
+        """
+        return sum(1.0 / (k + r) for r in ranks if r is not None)
 
     def _find_similar_memory(self, content: str, threshold: float = 0.85) -> Optional[Dict]:
         """
@@ -267,62 +324,157 @@ class RABELCore:
         if len(words) < 3:
             return None
 
-        # Search for potential duplicates
-        results = self.search_memory(content, limit=3, apply_recency=False)
+        # Search for potential duplicates (exclude archived)
+        results = self.search_memory(content, limit=3, apply_recency=False, include_archived=False)
         for r in results:
             sim = r.get('similarity', 0)
             if sim >= threshold:
                 return r
         return None
 
-    def add_memory(self, content: str, scope: str = "general", metadata: dict = None,
-                   reflect: bool = True) -> Dict:
+    def _detect_conflict(self, new_content: str, existing: Dict) -> Optional[str]:
         """
-        Add a memory with optional reflection (dedup check).
+        Detect if new content conflicts with existing memory (Gemini's refinement).
+
+        Returns conflict reason if detected, None otherwise.
+
+        Examples of conflicts:
+        - "Jasper woont in Amsterdam" vs "Jasper woont in Utrecht" -> location conflict
+        - "Storm is 7 jaar" vs "Storm is 8 jaar" -> age update (not conflict, just update)
+        """
+        new_lower = new_content.lower()
+        old_lower = existing["content"].lower()
+
+        # Simple heuristic: if both contain same subject but different values
+        # This is a basic implementation - could be enhanced with NLP
+
+        # Location conflict patterns
+        location_words = ["woont in", "lives in", "located in", "gevestigd in"]
+        for loc in location_words:
+            if loc in new_lower and loc in old_lower:
+                new_loc = new_lower.split(loc)[-1].split()[0] if loc in new_lower else ""
+                old_loc = old_lower.split(loc)[-1].split()[0] if loc in old_lower else ""
+                if new_loc and old_loc and new_loc != old_loc:
+                    return f"location_change: {old_loc} -> {new_loc}"
+
+        # Age/number update patterns (not conflict, just update)
+        import re
+        new_numbers = set(re.findall(r'\d+', new_content))
+        old_numbers = set(re.findall(r'\d+', existing["content"]))
+        if new_numbers != old_numbers and new_numbers and old_numbers:
+            # Numbers changed - likely an update, not conflict
+            return None  # Allow update without archiving
+
+        return None
+
+    def _archive_memory(self, memory_id: str, reason: str, superseded_by: str = None):
+        """
+        Archive a memory instead of deleting (Gemini's refinement).
+
+        Archived memories are kept for history but excluded from search by default.
+        """
+        self.conn.execute("""
+            UPDATE memories
+            SET archived = 1, archived_reason = ?, superseded_by = ?, updated_at = ?
+            WHERE id = ?
+        """, (reason, superseded_by, datetime.now().isoformat(), memory_id))
+        self.conn.commit()
+
+    def add_memory(self, content: str, scope: str = "general", memory_type: str = "fact",
+                   metadata: dict = None, reflect: bool = True) -> Dict:
+        """
+        Add a memory with optional reflection (dedup check) and conflict detection.
+
+        Memory types (Gemini's refinement):
+        - fact: Persistent facts (decay=0.01) - "my cat is Pixel"
+        - preference: User preferences (decay=0.05) - "I like dark mode"
+        - context: Current context (decay=0.3) - "working on RABEL"
+        - session: Session info (decay=0.5) - "debugging today"
+        - temporary: Temp info (decay=0.9) - "run this command"
 
         If reflect=True and similar memory exists:
-        - Updates existing memory instead of creating duplicate
-        - Returns {"action": "updated", "id": ...}
-
-        Otherwise:
-        - Creates new memory
-        - Returns {"action": "created", "id": ...}
+        - Checks for conflicts (location changes, etc.)
+        - Archives conflicting memory with reason
+        - Updates or creates new memory
+        - Returns {"action": "updated/created/archived", ...}
         """
-        # Reflection step (Gemini's suggestion)
+        decay_factor = self._get_decay_factor(memory_type)
+
+        # Reflection step with conflict detection (Gemini's refinement)
         if reflect:
             existing = self._find_similar_memory(content)
             if existing:
-                # Update existing memory
-                self.conn.execute("""
-                    UPDATE memories
-                    SET content = ?, updated_at = ?, access_count = access_count + 1
-                    WHERE id = ?
-                """, (content, datetime.now().isoformat(), existing["id"]))
-                self.conn.commit()
+                # Check for conflicts
+                conflict = self._detect_conflict(content, existing)
 
-                # Update embedding if available
-                if SQLITE_VEC_AVAILABLE:
-                    embedding = self._get_embedding(content)
-                    if embedding:
-                        try:
-                            self.conn.execute("DELETE FROM memory_vectors WHERE id = ?", (existing["id"],))
-                            self.conn.execute(
-                                "INSERT INTO memory_vectors (id, embedding) VALUES (?, ?)",
-                                (existing["id"], serialize_float32(embedding))
-                            )
-                            self.conn.commit()
-                        except:
-                            pass
+                if conflict:
+                    # Archive old memory, create new one
+                    new_id = self._generate_id(content)
+                    self._archive_memory(existing["id"], conflict, superseded_by=new_id)
 
-                return {"action": "updated", "id": existing["id"], "previous": existing["content"][:50]}
+                    # Create new memory
+                    created_at = datetime.now().isoformat()
+                    self.conn.execute(
+                        """INSERT INTO memories (id, content, scope, memory_type, decay_factor,
+                           created_at, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (new_id, content, scope, memory_type, decay_factor,
+                         created_at, json.dumps(metadata or {}))
+                    )
 
-        # Create new memory
+                    # Add embedding
+                    if SQLITE_VEC_AVAILABLE:
+                        embedding = self._get_embedding(content)
+                        if embedding:
+                            try:
+                                self.conn.execute(
+                                    "INSERT INTO memory_vectors (id, embedding) VALUES (?, ?)",
+                                    (new_id, serialize_float32(embedding))
+                                )
+                            except:
+                                pass
+
+                    self.conn.commit()
+                    return {
+                        "action": "archived_and_created",
+                        "id": new_id,
+                        "archived_id": existing["id"],
+                        "conflict": conflict,
+                        "previous": existing["content"][:50]
+                    }
+                else:
+                    # No conflict - just update existing memory
+                    self.conn.execute("""
+                        UPDATE memories
+                        SET content = ?, updated_at = ?, access_count = access_count + 1
+                        WHERE id = ?
+                    """, (content, datetime.now().isoformat(), existing["id"]))
+                    self.conn.commit()
+
+                    # Update embedding if available
+                    if SQLITE_VEC_AVAILABLE:
+                        embedding = self._get_embedding(content)
+                        if embedding:
+                            try:
+                                self.conn.execute("DELETE FROM memory_vectors WHERE id = ?", (existing["id"],))
+                                self.conn.execute(
+                                    "INSERT INTO memory_vectors (id, embedding) VALUES (?, ?)",
+                                    (existing["id"], serialize_float32(embedding))
+                                )
+                                self.conn.commit()
+                            except:
+                                pass
+
+                    return {"action": "updated", "id": existing["id"], "previous": existing["content"][:50]}
+
+        # Create new memory with memory_type and decay_factor
         memory_id = self._generate_id(content)
         created_at = datetime.now().isoformat()
 
         self.conn.execute(
-            "INSERT INTO memories (id, content, scope, created_at, metadata) VALUES (?, ?, ?, ?, ?)",
-            (memory_id, content, scope, created_at, json.dumps(metadata or {}))
+            """INSERT INTO memories (id, content, scope, memory_type, decay_factor,
+               created_at, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (memory_id, content, scope, memory_type, decay_factor,
+             created_at, json.dumps(metadata or {}))
         )
 
         # Update FTS index
@@ -347,96 +499,143 @@ class RABELCore:
                     pass
 
         self.conn.commit()
-        return {"action": "created", "id": memory_id}
+        return {"action": "created", "id": memory_id, "memory_type": memory_type}
 
     def search_memory(self, query: str, limit: int = 5, apply_recency: bool = True,
-                      hybrid: bool = True) -> List[Dict]:
+                      hybrid: bool = True, include_archived: bool = False) -> List[Dict]:
         """
-        Search memories with hybrid search (FTS5 + Vector) and recency bias.
+        Search memories with hybrid search (FTS5 + Vector), RRF scoring, and tunable recency.
 
-        Gemini's suggestions implemented:
-        - hybrid=True: Combines FTS5 exact match with vector semantic search
-        - apply_recency=True: Recent memories score higher
+        Gemini's refinements implemented:
+        - RRF (Reciprocal Rank Fusion) for combining search results
+        - Tunable decay based on memory_type
+        - include_archived=False excludes archived memories by default
         """
-        results = []
-        seen_ids = set()
+        # Collect results from different sources with their ranks
+        fts_results = {}  # id -> (rank, data)
+        vec_results = {}  # id -> (rank, data)
+        archived_filter = "" if include_archived else "AND (m.archived = 0 OR m.archived IS NULL)"
 
-        # Phase 1: FTS5 exact/keyword search (Gemini's Hybrid Search suggestion)
+        # Phase 1: FTS5 exact/keyword search
         if hybrid:
             try:
-                fts_results = self.conn.execute("""
+                fts_rows = self.conn.execute(f"""
                     SELECT m.id, m.content, m.scope, m.created_at,
-                           bm25(memories_fts) as fts_score
+                           m.memory_type, m.decay_factor, bm25(memories_fts) as fts_score
                     FROM memories_fts f
                     JOIN memories m ON f.id = m.id
-                    WHERE memories_fts MATCH ?
+                    WHERE memories_fts MATCH ? {archived_filter}
                     ORDER BY fts_score
                     LIMIT ?
-                """, (query, limit)).fetchall()
+                """, (query, limit * 2)).fetchall()
 
-                for r in fts_results:
-                    if r[0] not in seen_ids:
-                        score = 1.0 - (abs(r[4]) / 100)  # Normalize BM25 score
-                        if apply_recency:
-                            score = self._calculate_recency_score(r[3], score)
-                        results.append({
-                            "id": r[0],
-                            "content": r[1],
-                            "scope": r[2],
-                            "created_at": r[3],
-                            "similarity": round(score, 3),
-                            "match_type": "exact"
-                        })
-                        seen_ids.add(r[0])
+                for rank, r in enumerate(fts_rows, 1):
+                    fts_results[r[0]] = (rank, {
+                        "id": r[0],
+                        "content": r[1],
+                        "scope": r[2],
+                        "created_at": r[3],
+                        "memory_type": r[4] or "fact",
+                        "decay_factor": r[5] or 0.1,
+                        "match_type": "exact"
+                    })
             except Exception as e:
                 logger.debug(f"FTS5 search failed: {e}")
 
         # Phase 2: Vector semantic search
-        if SQLITE_VEC_AVAILABLE and len(results) < limit:
+        if SQLITE_VEC_AVAILABLE:
             embedding = self._get_embedding(query)
             if embedding:
                 try:
-                    vec_results = self.conn.execute("""
-                        SELECT v.id, v.distance, m.content, m.scope, m.created_at
+                    vec_rows = self.conn.execute(f"""
+                        SELECT v.id, v.distance, m.content, m.scope, m.created_at,
+                               m.memory_type, m.decay_factor
                         FROM memory_vectors v
                         JOIN memories m ON v.id = m.id
-                        WHERE v.embedding MATCH ? AND k = ?
+                        WHERE v.embedding MATCH ? AND k = ? {archived_filter}
                         ORDER BY v.distance
                     """, (serialize_float32(embedding), limit * 2)).fetchall()
 
-                    for r in vec_results:
-                        if r[0] not in seen_ids and len(results) < limit:
-                            score = 1.0 / (1.0 + abs(r[1]))
-                            if apply_recency:
-                                score = self._calculate_recency_score(r[4], score)
-                            results.append({
-                                "id": r[0],
-                                "similarity": round(score, 3),
-                                "content": r[2],
-                                "scope": r[3],
-                                "created_at": r[4],
-                                "match_type": "semantic"
-                            })
-                            seen_ids.add(r[0])
+                    for rank, r in enumerate(vec_rows, 1):
+                        vec_results[r[0]] = (rank, {
+                            "id": r[0],
+                            "content": r[2],
+                            "scope": r[3],
+                            "created_at": r[4],
+                            "memory_type": r[5] or "fact",
+                            "decay_factor": r[6] or 0.1,
+                            "match_type": "semantic"
+                        })
                 except Exception as e:
                     logger.debug(f"Vector search failed: {e}")
 
-        # Phase 3: Fallback LIKE search
+        # Phase 3: RRF Fusion (Gemini's refinement)
+        # Combine rankings from FTS5 and Vector search using Reciprocal Rank Fusion
+        all_ids = set(fts_results.keys()) | set(vec_results.keys())
+        results = []
+
+        for mem_id in all_ids:
+            fts_rank = fts_results.get(mem_id, (None, None))[0]
+            vec_rank = vec_results.get(mem_id, (None, None))[0]
+
+            # Calculate RRF score
+            rrf_score = self._rrf_score([r for r in [fts_rank, vec_rank] if r is not None])
+
+            # Get data from whichever source has it
+            data = fts_results.get(mem_id, (None, None))[1] or vec_results.get(mem_id, (None, None))[1]
+
+            if data:
+                # Apply tunable recency decay based on memory_type
+                if apply_recency:
+                    rrf_score = self._calculate_recency_score(
+                        data["created_at"],
+                        rrf_score,
+                        decay_factor=data.get("decay_factor"),
+                        memory_type=data.get("memory_type", "fact")
+                    )
+
+                # Determine match type
+                if mem_id in fts_results and mem_id in vec_results:
+                    match_type = "hybrid"  # Found in both - strongest match!
+                elif mem_id in fts_results:
+                    match_type = "exact"
+                else:
+                    match_type = "semantic"
+
+                results.append({
+                    "id": data["id"],
+                    "content": data["content"],
+                    "scope": data["scope"],
+                    "created_at": data["created_at"],
+                    "memory_type": data.get("memory_type", "fact"),
+                    "similarity": round(rrf_score, 3),
+                    "match_type": match_type
+                })
+
+        # Phase 4: Fallback LIKE search if no results
         if not results:
-            like_results = self.conn.execute(
-                "SELECT id, content, scope, created_at FROM memories WHERE content LIKE ? LIMIT ?",
-                (f"%{query}%", limit)
-            ).fetchall()
+            like_archived_filter = "" if include_archived else "AND (archived = 0 OR archived IS NULL)"
+            like_results = self.conn.execute(f"""
+                SELECT id, content, scope, created_at, memory_type, decay_factor
+                FROM memories
+                WHERE content LIKE ? {like_archived_filter}
+                LIMIT ?
+            """, (f"%{query}%", limit)).fetchall()
 
             for r in like_results:
                 score = 0.5  # Base score for LIKE matches
                 if apply_recency:
-                    score = self._calculate_recency_score(r[3], score)
+                    score = self._calculate_recency_score(
+                        r[3], score,
+                        decay_factor=r[5],
+                        memory_type=r[4] or "fact"
+                    )
                 results.append({
                     "id": r[0],
                     "content": r[1],
                     "scope": r[2],
                     "created_at": r[3],
+                    "memory_type": r[4] or "fact",
                     "similarity": round(score, 3),
                     "match_type": "keyword"
                 })
@@ -599,6 +798,10 @@ class RABELCore:
             "hybrid_search": SQLITE_VEC_AVAILABLE and fts5_available,
             "ollama_available": OLLAMA_AVAILABLE,
             "features": {
+                "rrf_scoring": True,
+                "tunable_decay": True,
+                "conflict_detection": True,
+                "memory_archiving": True,
                 "recency_bias": True,
                 "reflection": True,
                 "task_templates": True,
@@ -669,13 +872,14 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="rabel_add_memory",
-            description="Add a memory to RABEL with automatic dedup. If similar memory exists, it updates instead of creating duplicate.",
+            description="Add a memory with tunable decay and conflict detection. Memory types: fact (persists), preference (slow decay), context (moderate), session (fast), temporary (very fast).",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "content": {"type": "string", "description": "The memory content (what to remember)"},
                     "scope": {"type": "string", "description": "Memory scope: user, agent, team, or general", "default": "general"},
-                    "reflect": {"type": "boolean", "description": "Check for similar memories and update instead of duplicate (default: true)", "default": True}
+                    "memory_type": {"type": "string", "description": "Memory type: fact, preference, context, session, temporary (affects decay rate)", "default": "fact"},
+                    "reflect": {"type": "boolean", "description": "Check for conflicts and similar memories (default: true)", "default": True}
                 },
                 "required": ["content"]
             }
@@ -849,11 +1053,22 @@ One love, one fAmIly 💙"""
             r = get_rabel()
             content = arguments["content"]
             scope = arguments.get("scope", "general")
+            memory_type = arguments.get("memory_type", "fact")
             reflect = arguments.get("reflect", True)
 
-            result = r.add_memory(content, scope, reflect=reflect)
+            result = r.add_memory(content, scope, memory_type=memory_type, reflect=reflect)
 
-            if result["action"] == "updated":
+            if result["action"] == "archived_and_created":
+                return [types.TextContent(
+                    type="text",
+                    text=f"""🔄 Conflict detected - old memory archived!
+Conflict: {result['conflict']}
+Archived: {result['archived_id']} ({result['previous']}...)
+New ID: {result['id']}
+Type: {memory_type}
+Content: {content[:50]}..."""
+                )]
+            elif result["action"] == "updated":
                 return [types.TextContent(
                     type="text",
                     text=f"""🔄 Memory updated (reflection detected similar memory)
@@ -864,7 +1079,7 @@ New: {content[:50]}..."""
             else:
                 return [types.TextContent(
                     type="text",
-                    text=f"✅ Memory added!\nID: {result['id']}\nScope: {scope}\nContent: {content[:100]}..."
+                    text=f"✅ Memory added!\nID: {result['id']}\nType: {memory_type}\nScope: {scope}\nContent: {content[:100]}..."
                 )]
 
         elif name == "rabel_search":
