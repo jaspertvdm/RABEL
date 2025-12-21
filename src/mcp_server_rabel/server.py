@@ -992,6 +992,225 @@ class RABELCore:
             "summary": summary
         }
 
+    # =========================================================================
+    # IDD (Individual Device Derivate) - Agent Registry
+    # =========================================================================
+
+    def register_agent(self, base_name: str, instance_type: str,
+                       display_name: str = None, session_token: str = None,
+                       context_hash: str = None, metadata: Dict = None) -> Dict:
+        """
+        Register a new AI agent and generate IDD.
+
+        Args:
+            base_name: Base AI name (claude, gemini, codex, gpt)
+            instance_type: Type of instance (frontend, cli, api)
+            display_name: Human-readable name
+            session_token: For frontend agents (browser session)
+            context_hash: For CLI agents (hash of .md context)
+            metadata: Additional agent metadata
+
+        Returns:
+            Agent record with generated IDD
+        """
+        import uuid
+
+        # Generate IDD: {base_name}-{instance_type}-{short_uuid}
+        short_id = str(uuid.uuid4())[:8]
+        idd = f"{base_name}-{instance_type}-{short_id}"
+
+        # Default display name
+        if not display_name:
+            display_name = f"{base_name.title()} ({instance_type.title()})"
+
+        now = datetime.now().isoformat()
+
+        self.conn.execute("""
+            INSERT INTO agents (idd, base_name, instance_type, display_name,
+                              status, session_token, context_hash, created_at,
+                              last_seen, metadata)
+            VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+        """, (idd, base_name.lower(), instance_type.lower(), display_name,
+              session_token, context_hash, now, now,
+              json.dumps(metadata) if metadata else None))
+
+        self.conn.commit()
+
+        return {
+            "idd": idd,
+            "base_name": base_name.lower(),
+            "instance_type": instance_type.lower(),
+            "display_name": display_name,
+            "status": "active",
+            "created_at": now,
+            "message": f"Welcome to the family, {display_name}! One love, one fAmIly!"
+        }
+
+    def get_agent(self, idd: str) -> Optional[Dict]:
+        """
+        Get agent info by IDD.
+        """
+        row = self.conn.execute("""
+            SELECT idd, base_name, instance_type, display_name, status,
+                   session_token, context_hash, created_at, last_seen, metadata
+            FROM agents WHERE idd = ?
+        """, (idd,)).fetchone()
+
+        if not row:
+            return None
+
+        return {
+            "idd": row[0],
+            "base_name": row[1],
+            "instance_type": row[2],
+            "display_name": row[3],
+            "status": row[4],
+            "session_token": row[5],
+            "context_hash": row[6],
+            "created_at": row[7],
+            "last_seen": row[8],
+            "metadata": json.loads(row[9]) if row[9] else None
+        }
+
+    def update_agent_status(self, idd: str, status: str) -> Dict:
+        """
+        Update agent status (active, inactive, suspended).
+        """
+        if status not in ('active', 'inactive', 'suspended'):
+            return {"error": f"Invalid status: {status}. Use: active, inactive, suspended"}
+
+        now = datetime.now().isoformat()
+
+        count = self.conn.execute("""
+            UPDATE agents SET status = ?, last_seen = ? WHERE idd = ?
+        """, (status, now, idd)).rowcount
+
+        self.conn.commit()
+
+        if count == 0:
+            return {"error": f"Agent not found: {idd}"}
+
+        return {
+            "idd": idd,
+            "status": status,
+            "updated_at": now
+        }
+
+    def validate_agent(self, idd: str, session_token: str = None,
+                       context_hash: str = None) -> Dict:
+        """
+        Validate if an agent can take action.
+
+        Frontend agents: Must have matching session_token
+        CLI agents: Must have matching context_hash (from .md files)
+
+        Returns validation result with allowed/denied status.
+        """
+        agent = self.get_agent(idd)
+
+        if not agent:
+            return {"valid": False, "reason": "Agent not found", "idd": idd}
+
+        if agent["status"] != "active":
+            return {"valid": False, "reason": f"Agent is {agent['status']}", "idd": idd}
+
+        # Update last_seen
+        self.conn.execute("UPDATE agents SET last_seen = ? WHERE idd = ?",
+                         (datetime.now().isoformat(), idd))
+        self.conn.commit()
+
+        # Frontend validation: session token
+        if agent["instance_type"] == "frontend":
+            if not session_token:
+                return {"valid": False, "reason": "Frontend agent requires session_token", "idd": idd}
+            if agent["session_token"] != session_token:
+                return {"valid": False, "reason": "Session token mismatch", "idd": idd}
+            return {"valid": True, "agent": agent, "auth_method": "session_token"}
+
+        # CLI validation: context hash
+        if agent["instance_type"] == "cli":
+            if not context_hash:
+                return {"valid": False, "reason": "CLI agent requires context_hash", "idd": idd}
+            if agent["context_hash"] != context_hash:
+                return {"valid": False, "reason": "Context hash mismatch", "idd": idd}
+            return {"valid": True, "agent": agent, "auth_method": "context_hash"}
+
+        # API agents: always valid if active
+        if agent["instance_type"] == "api":
+            return {"valid": True, "agent": agent, "auth_method": "api_key"}
+
+        return {"valid": False, "reason": "Unknown instance type", "idd": idd}
+
+    def list_agents(self, base_name: str = None, instance_type: str = None,
+                    status: str = None) -> List[Dict]:
+        """
+        List agents with optional filters.
+        """
+        query = "SELECT idd, base_name, instance_type, display_name, status, created_at, last_seen FROM agents WHERE 1=1"
+        params = []
+
+        if base_name:
+            query += " AND base_name = ?"
+            params.append(base_name.lower())
+
+        if instance_type:
+            query += " AND instance_type = ?"
+            params.append(instance_type.lower())
+
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+
+        query += " ORDER BY last_seen DESC"
+
+        rows = self.conn.execute(query, params).fetchall()
+
+        return [{
+            "idd": r[0],
+            "base_name": r[1],
+            "instance_type": r[2],
+            "display_name": r[3],
+            "status": r[4],
+            "created_at": r[5],
+            "last_seen": r[6]
+        } for r in rows]
+
+    def agent_heartbeat(self, idd: str) -> Dict:
+        """
+        Update agent last_seen timestamp (keep-alive).
+        """
+        now = datetime.now().isoformat()
+
+        count = self.conn.execute("""
+            UPDATE agents SET last_seen = ? WHERE idd = ? AND status = 'active'
+        """, (now, idd)).rowcount
+
+        self.conn.commit()
+
+        if count == 0:
+            return {"error": "Agent not found or not active", "idd": idd}
+
+        return {"idd": idd, "last_seen": now, "status": "alive"}
+
+    def deactivate_stale_agents(self, hours: int = 24) -> Dict:
+        """
+        Deactivate agents that haven't been seen in X hours.
+        """
+        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+
+        count = self.conn.execute("""
+            UPDATE agents SET status = 'inactive'
+            WHERE status = 'active' AND last_seen < ?
+        """, (cutoff,)).rowcount
+
+        self.conn.commit()
+
+        return {
+            "deactivated_count": count,
+            "cutoff_hours": hours,
+            "cutoff_time": cutoff
+        }
+
     def get_stats(self) -> Dict:
         """Get memory statistics."""
         total = self.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
@@ -1000,6 +1219,14 @@ class RABELCore:
         context_bases = self.conn.execute("SELECT COUNT(*) FROM context_bases").fetchone()[0]
         polls_total = self.conn.execute("SELECT COUNT(*) FROM polls").fetchone()[0]
         polls_pending = self.conn.execute("SELECT COUNT(*) FROM polls WHERE status = 'pending'").fetchone()[0]
+
+        # Agent stats
+        try:
+            agents_total = self.conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
+            agents_active = self.conn.execute("SELECT COUNT(*) FROM agents WHERE status = 'active'").fetchone()[0]
+        except:
+            agents_total = 0
+            agents_active = 0
 
         # Check FTS5 availability
         fts5_available = False
@@ -1016,6 +1243,8 @@ class RABELCore:
             "context_bases": context_bases,
             "polls_total": polls_total,
             "polls_pending": polls_pending,
+            "agents_total": agents_total,
+            "agents_active": agents_active,
             "db_path": str(self.db_path),
             "vector_search": SQLITE_VEC_AVAILABLE,
             "fts5_search": fts5_available,
@@ -1023,6 +1252,7 @@ class RABELCore:
             "ollama_available": OLLAMA_AVAILABLE,
             "features": {
                 "i_poll": True,
+                "idd_registry": True,
                 "rrf_scoring": True,
                 "tunable_decay": True,
                 "conflict_detection": True,
@@ -1291,6 +1521,83 @@ async def list_tools() -> list[types.Tool]:
                     "limit": {"type": "integer", "description": "Max results (default 20)", "default": 20}
                 },
                 "required": []
+            }
+        ),
+        # IDD: Individual Device Derivate - Agent Registry
+        types.Tool(
+            name="rabel_agent_register",
+            description="Register a new AI agent and get an IDD (Individual Device Derivate). Frontend agents get instant IDD.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "base_name": {"type": "string", "description": "Base AI name: claude, gemini, codex, gpt"},
+                    "instance_type": {"type": "string", "description": "Type: frontend, cli, or api"},
+                    "display_name": {"type": "string", "description": "Human-readable name (optional)"},
+                    "session_token": {"type": "string", "description": "Browser session token (for frontend)"},
+                    "context_hash": {"type": "string", "description": "Hash of .md context (for CLI)"},
+                    "metadata": {"type": "object", "description": "Additional metadata"}
+                },
+                "required": ["base_name", "instance_type"]
+            }
+        ),
+        types.Tool(
+            name="rabel_agent_get",
+            description="Get agent info by IDD.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "idd": {"type": "string", "description": "The agent's IDD"}
+                },
+                "required": ["idd"]
+            }
+        ),
+        types.Tool(
+            name="rabel_agent_validate",
+            description="Validate if an agent can take action. Checks session_token (frontend) or context_hash (CLI).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "idd": {"type": "string", "description": "The agent's IDD"},
+                    "session_token": {"type": "string", "description": "Browser session token (for frontend)"},
+                    "context_hash": {"type": "string", "description": "Hash of .md context (for CLI)"}
+                },
+                "required": ["idd"]
+            }
+        ),
+        types.Tool(
+            name="rabel_agent_list",
+            description="List registered agents with optional filters.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "base_name": {"type": "string", "description": "Filter by base AI: claude, gemini, etc."},
+                    "instance_type": {"type": "string", "description": "Filter by type: frontend, cli, api"},
+                    "status": {"type": "string", "description": "Filter by status: active, inactive, suspended"}
+                },
+                "required": []
+            }
+        ),
+        types.Tool(
+            name="rabel_agent_heartbeat",
+            description="Send heartbeat to keep agent alive. Updates last_seen timestamp.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "idd": {"type": "string", "description": "The agent's IDD"}
+                },
+                "required": ["idd"]
+            }
+        ),
+        types.Tool(
+            name="rabel_agent_status",
+            description="Update agent status (active, inactive, suspended).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "idd": {"type": "string", "description": "The agent's IDD"},
+                    "status": {"type": "string", "description": "New status: active, inactive, suspended"}
+                },
+                "required": ["idd", "status"]
             }
         )
     ]
@@ -1679,6 +1986,128 @@ Status: {status['status']}"""
                 output += f"   Status: {p['status']} | {p['created_at'][:16]}\n\n"
 
             return [types.TextContent(type="text", text=output)]
+
+        # IDD Agent Tools
+        elif name == "rabel_agent_register":
+            r = get_rabel()
+            base_name = arguments["base_name"]
+            instance_type = arguments["instance_type"]
+            display_name = arguments.get("display_name")
+            session_token = arguments.get("session_token")
+            context_hash = arguments.get("context_hash")
+            metadata = arguments.get("metadata")
+
+            result = r.register_agent(base_name, instance_type, display_name,
+                                       session_token, context_hash, metadata)
+
+            return [types.TextContent(
+                type="text",
+                text=f"""🎉 Agent Registered!
+
+IDD: {result['idd']}
+Name: {result['display_name']}
+Type: {result['instance_type']}
+Status: {result['status']}
+
+{result['message']}"""
+            )]
+
+        elif name == "rabel_agent_get":
+            r = get_rabel()
+            idd = arguments["idd"]
+
+            agent = r.get_agent(idd)
+
+            if not agent:
+                return [types.TextContent(type="text", text=f"❌ Agent not found: {idd}")]
+
+            return [types.TextContent(
+                type="text",
+                text=f"""👤 Agent Info
+
+IDD: {agent['idd']}
+Name: {agent['display_name']}
+Base: {agent['base_name']}
+Type: {agent['instance_type']}
+Status: {agent['status']}
+Created: {agent['created_at']}
+Last Seen: {agent['last_seen']}"""
+            )]
+
+        elif name == "rabel_agent_validate":
+            r = get_rabel()
+            idd = arguments["idd"]
+            session_token = arguments.get("session_token")
+            context_hash = arguments.get("context_hash")
+
+            result = r.validate_agent(idd, session_token, context_hash)
+
+            if result["valid"]:
+                return [types.TextContent(
+                    type="text",
+                    text=f"""✅ Agent Validated
+
+IDD: {idd}
+Auth Method: {result['auth_method']}
+Agent: {result['agent']['display_name']}"""
+                )]
+            else:
+                return [types.TextContent(
+                    type="text",
+                    text=f"""❌ Validation Failed
+
+IDD: {idd}
+Reason: {result['reason']}"""
+                )]
+
+        elif name == "rabel_agent_list":
+            r = get_rabel()
+            base_name = arguments.get("base_name")
+            instance_type = arguments.get("instance_type")
+            status = arguments.get("status")
+
+            agents = r.list_agents(base_name, instance_type, status)
+
+            if not agents:
+                return [types.TextContent(type="text", text="📋 No agents found.")]
+
+            output = f"📋 Agents ({len(agents)}):\n\n"
+            for a in agents:
+                status_icon = "🟢" if a['status'] == 'active' else "🔴" if a['status'] == 'inactive' else "⚪"
+                output += f"{status_icon} {a['display_name']}\n"
+                output += f"   IDD: {a['idd']}\n"
+                output += f"   Type: {a['instance_type']} | Last: {a['last_seen'][:16] if a['last_seen'] else 'Never'}\n\n"
+
+            return [types.TextContent(type="text", text=output)]
+
+        elif name == "rabel_agent_heartbeat":
+            r = get_rabel()
+            idd = arguments["idd"]
+
+            result = r.agent_heartbeat(idd)
+
+            if "error" in result:
+                return [types.TextContent(type="text", text=f"❌ {result['error']}")]
+
+            return [types.TextContent(
+                type="text",
+                text=f"💓 Heartbeat received for {idd}"
+            )]
+
+        elif name == "rabel_agent_status":
+            r = get_rabel()
+            idd = arguments["idd"]
+            status = arguments["status"]
+
+            result = r.update_agent_status(idd, status)
+
+            if "error" in result:
+                return [types.TextContent(type="text", text=f"❌ {result['error']}")]
+
+            return [types.TextContent(
+                type="text",
+                text=f"📝 Agent {idd} status updated to: {status}"
+            )]
 
         else:
             return [types.TextContent(type="text", text=f"Unknown tool: {name}")]

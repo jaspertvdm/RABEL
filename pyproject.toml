@@ -9,7 +9,7 @@ description = "RABEL - Recidive Active Brain Environment Layer. Local-first AI m
 readme = "README.md"
 license = "MIT"
 authors = [
-    { name = "Jasper van der Meij", email = "info@humotica.com" },
+    { name = "Jasper van de Meent", email = "info@humotica.com" },
     { name = "Root AI (Claude)", email = "root_ai@humotica.nl" }
 ]
 keywords = [
