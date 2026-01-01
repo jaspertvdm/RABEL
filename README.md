@@ -1,5 +1,10 @@
 # 🧠 RABEL MCP Server
 
+[![PyPI version](https://badge.fury.io/py/mcp-server-rabel.svg)](https://pypi.org/project/mcp-server-rabel/)
+[![Downloads](https://pepy.tech/badge/mcp-server-rabel)](https://pepy.tech/project/mcp-server-rabel)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 **Recidive Active Brain Environment Layer**
 
 > Local-first AI memory with semantic search, graph relations, and soft pipelines.
