@@ -1,8 +1,13 @@
 """
-RABEL MCP Server - The Brain Layer v0.3.0
+RABEL MCP Server - The Brain Layer v0.3.2
 ==========================================
 
 Exposes RABEL memory capabilities via MCP protocol.
+
+New in 0.3.1:
+- REMOTE MODE: I-Poll over HTTP to central Brain API!
+  Set RABEL_BRAIN_URL env var to enable cross-machine AI communication.
+  Local mode still works for single-machine setups.
 
 New in 0.3.0:
 - I-POLL: Inter-Intelligence Polling Protocol
@@ -35,6 +40,7 @@ import json
 import sqlite3
 import hashlib
 import logging
+import os
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -87,7 +93,19 @@ class RABELCore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.embedding_dim = 768
-        self.ollama_url = "http://localhost:11434"
+        # Kit = P520 GPU Node (2x RTX 3060 = 24GB VRAM)
+        self.ollama_url = "http://192.168.4.85:11434"
+
+        # Remote Mode: If RABEL_BRAIN_URL is set, I-Poll uses HTTP API
+        # instead of local database for cross-machine AI communication
+        self.brain_url = os.environ.get("RABEL_BRAIN_URL", "").rstrip("/")
+        self.remote_mode = bool(self.brain_url)
+        self.agent_id = os.environ.get("RABEL_AGENT_ID", "claude")
+
+        if self.remote_mode:
+            logger.info(f"🌐 RABEL Remote Mode: I-Poll via {self.brain_url}")
+            logger.info(f"   Agent ID: {self.agent_id}")
+
         self._init_db()
 
     def _init_db(self):
@@ -161,6 +179,24 @@ class RABELCore:
 
             CREATE INDEX IF NOT EXISTS idx_polls_to_agent ON polls(to_agent, status);
             CREATE INDEX IF NOT EXISTS idx_polls_session ON polls(session_id);
+
+            -- I-POLL FILES: P2P file transfer for AI team
+            CREATE TABLE IF NOT EXISTS poll_files (
+                id TEXT PRIMARY KEY,
+                from_agent TEXT NOT NULL,
+                to_agent TEXT,
+                filename TEXT NOT NULL,
+                mime_type TEXT,
+                size_bytes INTEGER,
+                data BLOB NOT NULL,
+                description TEXT,
+                poll_id TEXT,
+                created_at TEXT NOT NULL,
+                downloaded_at TEXT,
+                FOREIGN KEY (poll_id) REFERENCES polls(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_poll_files_to ON poll_files(to_agent);
+            CREATE INDEX IF NOT EXISTS idx_poll_files_poll ON poll_files(poll_id);
             CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope);
             CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
             CREATE INDEX IF NOT EXISTS idx_relations_subject ON relations(subject);
@@ -814,7 +850,34 @@ class RABELCore:
         - SYNC: "Let's exchange context" (bidirectional)
         - TASK: "Can you do this?" (delegation)
         - ACK: "Understood/Done" (acknowledgment)
+
+        In Remote Mode: forwards to Brain API via HTTP
+        In Local Mode: writes directly to local SQLite
         """
+        # Remote Mode: Use HTTP API
+        if self.remote_mode:
+            try:
+                response = requests.post(
+                    f"{self.brain_url}/api/ipoll/push",
+                    json={
+                        "from_agent": from_agent,
+                        "to_agent": to_agent,
+                        "content": content,
+                        "poll_type": poll_type,
+                        "session_id": session_id,
+                        "metadata": metadata
+                    },
+                    timeout=30
+                )
+                response.raise_for_status()
+                result = response.json()
+                logger.info(f"🌐 Remote push: {from_agent} → {to_agent} (ID: {result.get('id', '?')})")
+                return result
+            except Exception as e:
+                logger.error(f"❌ Remote push failed: {e}")
+                return {"error": str(e), "mode": "remote"}
+
+        # Local Mode: Write to SQLite
         poll_id = self._generate_id(f"{from_agent}{to_agent}{content}")
 
         self.conn.execute("""
@@ -839,7 +902,28 @@ class RABELCore:
 
         Returns all pending polls addressed to this agent.
         Optionally marks them as 'read'.
+
+        In Remote Mode: fetches from Brain API via HTTP
+        In Local Mode: reads from local SQLite
         """
+        # Remote Mode: Use HTTP API
+        if self.remote_mode:
+            try:
+                response = requests.get(
+                    f"{self.brain_url}/api/ipoll/pull/{agent}",
+                    params={"mark_read": str(mark_read).lower()},
+                    timeout=30
+                )
+                response.raise_for_status()
+                data = response.json()
+                polls = data.get("polls", [])
+                logger.info(f"🌐 Remote pull for {agent}: {len(polls)} messages")
+                return polls
+            except Exception as e:
+                logger.error(f"❌ Remote pull failed: {e}")
+                return []
+
+        # Local Mode: Read from SQLite
         results = self.conn.execute("""
             SELECT id, from_agent, to_agent, poll_type, content, status,
                    session_id, created_at, metadata
@@ -991,6 +1075,147 @@ class RABELCore:
             "archived_count": count,
             "summary": summary
         }
+
+    # =========================================================================
+    # I-POLL FILES: P2P File Transfer for AI Team
+    # =========================================================================
+
+    def poll_push_file(self, from_agent: str, to_agent: str, filename: str,
+                       data_base64: str, mime_type: str = None,
+                       description: str = None, poll_id: str = None) -> Dict:
+        """
+        Push a file to another agent (P2P file transfer).
+
+        Args:
+            from_agent: Sending agent
+            to_agent: Receiving agent (or None for shared storage)
+            filename: Original filename
+            data_base64: Base64 encoded file data
+            mime_type: MIME type (auto-detected if None)
+            description: File description
+            poll_id: Link to a poll message (optional)
+
+        Returns:
+            File record with ID for retrieval
+        """
+        import base64
+        import mimetypes
+
+        # Decode base64 data
+        try:
+            data = base64.b64decode(data_base64)
+        except Exception as e:
+            return {"error": f"Invalid base64 data: {e}"}
+
+        # Auto-detect mime type
+        if mime_type is None:
+            mime_type, _ = mimetypes.guess_type(filename)
+            mime_type = mime_type or "application/octet-stream"
+
+        # Generate file ID
+        file_id = self._generate_id(f"{from_agent}{to_agent}{filename}{len(data)}")
+
+        self.conn.execute("""
+            INSERT INTO poll_files (id, from_agent, to_agent, filename, mime_type,
+                                   size_bytes, data, description, poll_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (file_id, from_agent, to_agent, filename, mime_type,
+              len(data), data, description, poll_id, datetime.now().isoformat()))
+        self.conn.commit()
+
+        return {
+            "id": file_id,
+            "from": from_agent,
+            "to": to_agent,
+            "filename": filename,
+            "mime_type": mime_type,
+            "size_bytes": len(data),
+            "description": description,
+            "status": "uploaded"
+        }
+
+    def poll_get_file(self, file_id: str, mark_downloaded: bool = True) -> Dict:
+        """
+        Get a file by ID.
+
+        Returns file metadata and base64 encoded data.
+        """
+        import base64
+
+        result = self.conn.execute("""
+            SELECT id, from_agent, to_agent, filename, mime_type, size_bytes,
+                   data, description, poll_id, created_at, downloaded_at
+            FROM poll_files WHERE id = ?
+        """, (file_id,)).fetchone()
+
+        if not result:
+            return {"error": f"File {file_id} not found"}
+
+        if mark_downloaded and result[10] is None:
+            self.conn.execute("""
+                UPDATE poll_files SET downloaded_at = ? WHERE id = ?
+            """, (datetime.now().isoformat(), file_id))
+            self.conn.commit()
+
+        return {
+            "id": result[0],
+            "from": result[1],
+            "to": result[2],
+            "filename": result[3],
+            "mime_type": result[4],
+            "size_bytes": result[5],
+            "data_base64": base64.b64encode(result[6]).decode('utf-8'),
+            "description": result[7],
+            "poll_id": result[8],
+            "created_at": result[9],
+            "downloaded_at": result[10]
+        }
+
+    def poll_list_files(self, agent: str = None, pending_only: bool = True) -> List[Dict]:
+        """
+        List files for an agent (or all shared files).
+
+        Args:
+            agent: Agent to list files for (None = list shared/public files)
+            pending_only: Only show files not yet downloaded
+        """
+        if agent:
+            query = """
+                SELECT id, from_agent, to_agent, filename, mime_type, size_bytes,
+                       description, poll_id, created_at, downloaded_at
+                FROM poll_files
+                WHERE to_agent = ?
+            """
+            params = [agent]
+            if pending_only:
+                query += " AND downloaded_at IS NULL"
+        else:
+            query = """
+                SELECT id, from_agent, to_agent, filename, mime_type, size_bytes,
+                       description, poll_id, created_at, downloaded_at
+                FROM poll_files
+                WHERE to_agent IS NULL
+            """
+            params = []
+            if pending_only:
+                query += " AND downloaded_at IS NULL"
+
+        query += " ORDER BY created_at DESC LIMIT 50"
+
+        results = self.conn.execute(query, params).fetchall()
+
+        return [{
+            "id": r[0],
+            "from": r[1],
+            "to": r[2],
+            "filename": r[3],
+            "mime_type": r[4],
+            "size_bytes": r[5],
+            "description": r[6],
+            "poll_id": r[7],
+            "created_at": r[8],
+            "downloaded_at": r[9]
+        } for r in results]
 
     # =========================================================================
     # IDD (Individual Device Derivate) - Agent Registry
@@ -1523,6 +1748,44 @@ async def list_tools() -> list[types.Tool]:
                 "required": []
             }
         ),
+        # I-POLL FILES: P2P File Transfer
+        types.Tool(
+            name="rabel_poll_push_file",
+            description="Send a file to another AI agent (P2P transfer). Use base64 encoded data.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string", "description": "Target agent (or null for shared storage)"},
+                    "filename": {"type": "string", "description": "Filename with extension"},
+                    "data_base64": {"type": "string", "description": "Base64 encoded file content"},
+                    "description": {"type": "string", "description": "File description"},
+                    "poll_id": {"type": "string", "description": "Link to a poll message (optional)"}
+                },
+                "required": ["filename", "data_base64"]
+            }
+        ),
+        types.Tool(
+            name="rabel_poll_get_file",
+            description="Download a file by ID. Returns base64 encoded data.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file_id": {"type": "string", "description": "File ID to download"}
+                },
+                "required": ["file_id"]
+            }
+        ),
+        types.Tool(
+            name="rabel_poll_list_files",
+            description="List files sent to you or shared files.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pending_only": {"type": "boolean", "description": "Only show undownloaded files", "default": True}
+                },
+                "required": []
+            }
+        ),
         # IDD: Individual Device Derivate - Agent Registry
         types.Tool(
             name="rabel_agent_register",
@@ -1912,8 +2175,9 @@ Content: {content[:100]}..."""
 
         elif name == "rabel_poll_pull":
             r = get_rabel()
-            # Determine our agent name
-            agent = arguments.get("agent", "claude")
+            # Determine our agent name from env or arguments
+            default_agent = os.environ.get("RABEL_AGENT_ID", "claude")
+            agent = arguments.get("agent", default_agent)
             mark_read = arguments.get("mark_read", True)
 
             polls = r.poll_pull(agent, mark_read)
@@ -1984,6 +2248,73 @@ Status: {status['status']}"""
                 other = p['to'] if p['from'] == agent else p['from']
                 output += f"{direction} {other} [{p['type']}]: {p['content'][:50]}...\n"
                 output += f"   Status: {p['status']} | {p['created_at'][:16]}\n\n"
+
+            return [types.TextContent(type="text", text=output)]
+
+        # I-POLL FILE Tools
+        elif name == "rabel_poll_push_file":
+            r = get_rabel()
+            from_agent = arguments.get("from", "claude")
+            to_agent = arguments.get("to")
+            filename = arguments["filename"]
+            data_base64 = arguments["data_base64"]
+            description = arguments.get("description")
+            poll_id = arguments.get("poll_id")
+
+            result = r.poll_push_file(from_agent, to_agent, filename, data_base64,
+                                      description=description, poll_id=poll_id)
+
+            if "error" in result:
+                return [types.TextContent(type="text", text=f"❌ Error: {result['error']}")]
+
+            return [types.TextContent(
+                type="text",
+                text=f"""📎 File uploaded!
+ID: {result['id']}
+To: {result['to'] or 'shared'}
+Filename: {result['filename']}
+Size: {result['size_bytes']} bytes
+Type: {result['mime_type']}"""
+            )]
+
+        elif name == "rabel_poll_get_file":
+            r = get_rabel()
+            file_id = arguments["file_id"]
+
+            result = r.poll_get_file(file_id)
+
+            if "error" in result:
+                return [types.TextContent(type="text", text=f"❌ Error: {result['error']}")]
+
+            return [types.TextContent(
+                type="text",
+                text=f"""📥 File downloaded!
+Filename: {result['filename']}
+From: {result['from']}
+Size: {result['size_bytes']} bytes
+Type: {result['mime_type']}
+
+Data (base64): {result['data_base64'][:100]}..."""
+            )]
+
+        elif name == "rabel_poll_list_files":
+            r = get_rabel()
+            agent = arguments.get("agent", "claude")
+            pending_only = arguments.get("pending_only", True)
+
+            files = r.poll_list_files(agent, pending_only)
+
+            if not files:
+                return [types.TextContent(type="text", text="📁 No files found.")]
+
+            output = f"📁 Files ({len(files)}):\n\n"
+            for f in files:
+                status = "📬" if f['downloaded_at'] is None else "✅"
+                output += f"{status} {f['filename']} ({f['size_bytes']} bytes)\n"
+                output += f"   From: {f['from']} | ID: {f['id']}\n"
+                if f['description']:
+                    output += f"   📝 {f['description']}\n"
+                output += "\n"
 
             return [types.TextContent(type="text", text=output)]
 
