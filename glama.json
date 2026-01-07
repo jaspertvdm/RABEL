@@ -2,10 +2,5 @@
   "$schema": "https://glama.ai/mcp/schemas/server.json",
   "maintainers": [
     "jaspertvdm"
-  ],
-  "name": "RABEL",
-  "description": "Local-first AI memory with semantic search, graph relations, and I-Poll messaging",
-  "repository": "https://github.com/jaspertvdm/RABEL",
-  "license": "AGPL-3.0",
-  "homepage": "https://humotica.com"
+  ]
 }
