@@ -53,8 +53,8 @@ mcp-server-rabel = "mcp_server_rabel:main"
 
 [project.urls]
 Homepage = "https://humotica.com"
-Repository = "https://github.com/jaspertvdm/mcp-server-rabel"
-Documentation = "https://github.com/jaspertvdm/mcp-server-rabel#readme"
+Repository = "https://github.com/jaspertvdm/RABEL"
+Documentation = "https://github.com/jaspertvdm/RABEL#readme"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mcp_server_rabel"]
