@@ -3,7 +3,7 @@
 [![PyPI version](https://badge.fury.io/py/mcp-server-rabel.svg)](https://pypi.org/project/mcp-server-rabel/)
 [![Downloads](https://pepy.tech/badge/mcp-server-rabel)](https://pepy.tech/project/mcp-server-rabel)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
 **Recidive Active Brain Environment Layer**
 
@@ -16,6 +16,8 @@ By **Jasper & Root AI** from [HumoticaOS](https://humotica.com) 💙
 
 ## 🚀 Quick Start
 
+### Option 1: pip install (recommended)
+
 ```bash
 # Install
 pip install mcp-server-rabel
@@ -24,11 +26,33 @@ pip install mcp-server-rabel
 pip install mcp-server-rabel[full]
 
 # Add to Claude CLI
-claude mcp add rabel -- python -m mcp_server_rabel
+claude mcp add rabel -- mcp-server-rabel
 
 # Verify
 claude mcp list
 # rabel: ✓ Connected
+```
+
+### Option 2: Docker
+
+```bash
+# Build
+docker build -t mcp-server-rabel .
+
+# Run (MCP uses stdio)
+docker run -i mcp-server-rabel
+
+# With persistent data
+docker run -i -v rabel-data:/data mcp-server-rabel
+```
+
+### Option 3: From source
+
+```bash
+git clone https://github.com/jaspertvdm/RABEL.git
+cd RABEL
+pip install -e .
+mcp-server-rabel
 ```
 
 ---
@@ -210,7 +234,9 @@ RABEL is part of a larger ecosystem:
 
 ## 📜 License
 
-MIT License - One love, one fAmIly 💙
+AGPL-3.0 License - One love, one fAmIly 💙
+
+This is open source software. If you use it in a network service, you must share your modifications.
 
 ---
 
